@@ -1,0 +1,36 @@
+# Core spec for the PQ40/40 core - the YAML file IS the spec.
+# Loaded directly by optimizers.objective.load_core_spec (no loader layer).
+# Full datasheet reference: pq_40x40.pdf (same folder).
+name: pq_40x40
+
+params:
+  center_post_diameter: 0.0149    # m
+  leg_inner_diameter: 0.037       # m
+  leg_height: 0.0398              # m
+  window_height: 0.0295           # m
+  coil_clearance: 0.0005          # m
+  mur: 1680                       # N87 relative permeability
+  A_e: 1.89e-4                    # m2 effective cross-section
+  l_e: 9.3e-2                     # m effective magnetic path
+  sigma_l_over_A: 492             # 1/m
+  AL: 4300                        # nH/N^2 ungapped (N87)
+  material: N87
+
+bounds:
+  - [0.010, 0.022]
+  - [0.026, 0.050]
+  - [0.025, 0.060]
+  - [0.015, 0.045]
+  - [0.0001, 0.003]
+  - [0.00005, 0.005]
+
+param_names:
+  - center_post_diameter
+  - leg_inner_diameter
+  - leg_height
+  - window_height
+  - coil_clearance
+  - gap_size
+
+target_L: 2.6e-7                  # H
+mesh_size: 0.001                  # m

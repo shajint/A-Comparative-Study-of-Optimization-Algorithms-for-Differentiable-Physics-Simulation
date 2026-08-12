@@ -1,0 +1,342 @@
+import numpy as onp
+import jax
+import jax.numpy as np
+import sys
+import time
+import functools
+from dataclasses import dataclass
+from typing import Any, Optional
+from .generate_mesh import Mesh
+from .basis import get_face_shape_vals_and_grads, get_shape_vals_and_grads
+from . import logger
+
+
+# onp.set_printoptions(threshold=sys.maxsize,
+#                      linewidth=1000,
+#                      suppress=True,
+#                      precision=5)
+
+
+@dataclass
+class FiniteElement:
+    """Finite element class for one variable (scalar magnetic vector potential A).
+
+    This class holds the mesh, element type, quadrature data, and Dirichlet
+    boundary conditions for the 2D axisymmetric magnetostatics problem.
+
+    Attributes
+    ----------
+    mesh : Mesh
+        Stores points (coordinates) and cells (connectivity).
+    vec : int
+        Number of solution components. For scalar A, vec = 1.
+    dim : int
+        Spatial dimension. For the 2D axisymmetric (r, z) problem, dim = 2.
+    ele_type : str
+        Element type. This project uses 'QUAD4'.
+    quadrature_rule : Any
+        Quadrature rule passed to ``basix.make_quadrature``. Can be ``None``,
+        a ``basix.QuadratureType``, or a string accepted by
+        ``basix.quadrature.string_to_type``.
+    quadrature_order : int
+        Order of Gaussian quadrature. Defaults to the element's default order.
+    dirichlet_bc_info : list
+        Dirichlet boundary condition information, structured as:
+
+        - **location_fns**: list of callables
+          Each callable takes a point (JaxArray) and returns a boolean indicating
+          if the point satisfies the location condition (e.g., A = 0 on the
+          outer boundary).
+        - **vecs**: list of integers
+          Each integer must be in the range of 0 to vec - 1, specifying which
+          component of the (vector) variable the Dirichlet condition applies to.
+        - **value_fns**: list of callables
+          Each callable takes a point and returns the Dirichlet value.
+    """
+    mesh: Mesh
+    vec: int
+    dim: int
+    ele_type: str
+    dirichlet_bc_info: Optional[list] = None
+    quadrature_rule: Any = None
+    quadrature_order: Optional[int] = None
+    
+    def __post_init__(self):
+        self.points = self.mesh.points
+        self.cells = self.mesh.cells
+        self.num_cells = len(self.cells)
+        self.num_total_nodes = len(self.mesh.points)
+        self.num_total_dofs = self.num_total_nodes * self.vec
+
+        start = time.time()
+        logger.info("Computing shape function values, gradients, etc.")
+
+        self.shape_vals, self.shape_grads_ref, self.quad_weights = get_shape_vals_and_grads(
+            self.ele_type,
+            quadrature_rule=self.quadrature_rule,
+            quadrature_order=self.quadrature_order,
+        )
+        self.face_shape_vals, self.face_shape_grads_ref, self.face_quad_weights, self.face_normals, self.face_inds \
+            = get_face_shape_vals_and_grads(
+                self.ele_type,
+                quadrature_rule=self.quadrature_rule,
+                quadrature_order=self.quadrature_order,
+            )
+        self.num_quads = self.shape_vals.shape[0]
+        self.num_nodes = self.shape_vals.shape[1]
+        self.num_faces = self.face_shape_vals.shape[0]
+        self.num_face_quads = self.face_quad_weights.shape[1]
+
+        self.shape_grads, self.JxW = self.get_shape_grads()
+
+        self.node_inds_list, self.vec_inds_list, self.vals_list = self.Dirichlet_boundary_conditions(self.dirichlet_bc_info)
+
+        end = time.time()
+        compute_time = end - start
+        
+        logger.info(f"Solving a problem with {len(self.cells)} cells, "
+                    f"{self.num_total_nodes}x{self.vec} = {self.num_total_dofs} dofs.")
+        logger.info(f"Element type is {self.ele_type}, using {self.num_quads} quad points per element.")
+        logger.info(f"Pre-computations took {end - start:.3f} [s]")
+        
+    def get_shape_grads(self, points=None):
+        """Compute shape function gradient w.r.t. physical coordinates.
+
+        Reference: Hughes, The Finite Element Method, Page 147, Eq. (3.9.3).
+
+        Returns
+        -------
+        shape_grads_physical : JaxArray
+            Shape is (num_cells, num_quads, num_nodes, dim).
+        JxW : JaxArray
+            Shape is (num_cells, num_quads).
+        """
+        points = self.points if points is None else points
+        assert self.shape_grads_ref.shape == (self.num_quads, self.num_nodes, self.dim)
+        physical_coos = np.take(points, self.cells, axis=0)  # (num_cells, num_nodes, dim)
+        jacobian_dx_deta = np.sum(physical_coos[:, None, :, :, None] *
+                                   self.shape_grads_ref[None, :, :, None, :], axis=2, keepdims=True)
+        jacobian_det = np.linalg.det(jacobian_dx_deta)[:, :, 0]  # (num_cells, num_quads)
+        jacobian_deta_dx = np.linalg.inv(jacobian_dx_deta)
+        shape_grads_physical = (self.shape_grads_ref[None, :, :, None, :]
+                                @ jacobian_deta_dx)[:, :, :, 0, :]
+        JxW = jacobian_det * self.quad_weights[None, :]
+        return shape_grads_physical, JxW
+    
+    def get_face_shape_grads(self, boundary_inds, points=None):
+        """Face shape function gradients and JxW (for surface integrals).
+        Nanson's formula maps the physical surface integral to the reference domain.
+
+        Parameters
+        ----------
+        boundary_inds : NumpyArray
+            Shape is (num_selected_faces, 2).
+
+        Returns
+        -------
+        face_shape_grads_physical : JaxArray
+            Shape is (num_selected_faces, num_face_quads, num_nodes, dim).
+        nanson_scale : JaxArray
+            Shape is (num_selected_faces, num_face_quads).
+        """
+        points = self.points if points is None else points
+        physical_coos = np.take(points, self.cells, axis=0)  # (num_cells, num_nodes, dim)
+        selected_coos = physical_coos[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, dim)
+        selected_f_shape_grads_ref = self.face_shape_grads_ref[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes, dim)
+        selected_f_normals = self.face_normals[boundary_inds[:, 1]]  # (num_selected_faces, dim)
+
+        jacobian_dx_deta = np.sum(selected_coos[:, None, :, :, None] * selected_f_shape_grads_ref[:, :, :, None, :], axis=2)
+        jacobian_det = np.linalg.det(jacobian_dx_deta)  # (num_selected_faces, num_face_quads)
+        jacobian_deta_dx = np.linalg.inv(jacobian_dx_deta)  # (num_selected_faces, num_face_quads, dim, dim)
+
+        face_shape_grads_physical = (selected_f_shape_grads_ref[:, :, :, None, :] @ jacobian_deta_dx[:, :, None, :, :])[:, :, :, 0, :]
+
+        nanson_scale = np.linalg.norm((selected_f_normals[:, None, None, :] @ jacobian_deta_dx)[:, :, 0, :], axis=-1)
+        selected_weights = self.face_quad_weights[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads)
+        nanson_scale = nanson_scale * jacobian_det * selected_weights
+        return face_shape_grads_physical, nanson_scale
+    
+    def get_physical_quad_points(self, points=None):
+        """Compute physical quadrature points.
+
+        Returns
+        -------
+        physical_quad_points : JaxArray
+            Shape is (num_cells, num_quads, dim).
+        """
+        points = self.points if points is None else points
+        physical_coos = np.take(points, self.cells, axis=0)
+        physical_quad_points = np.sum(self.shape_vals[None, :, :, None] * physical_coos[:, None, :, :], axis=2)
+        return physical_quad_points
+    
+    def get_physical_surface_quad_points(self, boundary_inds, points=None):
+        """Compute physical quadrature points on the surface.
+
+        Parameters
+        ----------
+        boundary_inds : NumpyArray
+            Shape is (num_selected_faces, 2).
+
+        Returns
+        -------
+        physical_surface_quad_points : JaxArray
+            Shape is (num_selected_faces, num_face_quads, dim).
+        """
+        points = self.points if points is None else points
+        physical_coos = np.take(points, self.cells, axis=0)
+        selected_coos = physical_coos[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, dim)
+        selected_face_shape_vals = self.face_shape_vals[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes)
+        physical_surface_quad_points = np.sum(selected_face_shape_vals[:, :, :, None] * selected_coos[:, None, :, :], axis=2)
+        return physical_surface_quad_points
+    
+    def Dirichlet_boundary_conditions(self, dirichlet_bc_info):
+        """Indices and values for Dirichlet B.C.
+
+        Parameters
+        ----------
+        dirichlet_bc_info : list
+            [location_fns, vecs, value_fns]
+
+        Returns
+        -------
+        node_inds_list : list[JaxArray]
+            Node indices, values from 0 to num_total_nodes - 1.
+        vec_inds_list : list[JaxArray]
+            Component indices, values from 0 to vec - 1.
+        vals_list : list[JaxArray]
+            Dirichlet values to be assigned.
+        """
+        node_inds_list = []
+        vec_inds_list = []
+        vals_list = []
+        if dirichlet_bc_info is not None:
+            location_fns, vecs, value_fns = dirichlet_bc_info
+            assert len(location_fns) == len(value_fns) and len(value_fns) == len(vecs)
+            for i in range(len(location_fns)):
+                num_args = location_fns[i].__code__.co_argcount
+                if num_args == 1:
+                    location_fn = lambda point, ind: location_fns[i](point)
+                elif num_args == 2:
+                    location_fn = location_fns[i]
+                else:
+                    raise ValueError(f"Wrong number of arguments for location_fn: must be 1 or 2, get {num_args}")
+
+                node_inds = np.argwhere(jax.vmap(location_fn)(self.points, np.arange(self.num_total_nodes))).reshape(-1)
+                vec_inds = np.ones_like(node_inds, dtype=np.int32) * vecs[i]
+                values = jax.vmap(value_fns[i])(self.points[node_inds].reshape(-1, self.dim)).reshape(-1)
+                node_inds_list.append(node_inds)
+                vec_inds_list.append(vec_inds)
+                vals_list.append(values)
+        return node_inds_list, vec_inds_list, vals_list
+    
+    def update_Dirichlet_boundary_conditions(self, dirichlet_bc_info):
+        """Reset Dirichlet boundary conditions.
+        Useful when a time-dependent problem is solved and the BC
+        needs to be updated at each iteration.
+
+        Parameters
+        ----------
+        dirichlet_bc_info : list
+            [location_fns, vecs, value_fns]
+        """
+        self.node_inds_list, self.vec_inds_list, self.vals_list = self.Dirichlet_boundary_conditions(dirichlet_bc_info)
+        
+    def get_boundary_conditions_inds(self, location_fns):
+        """Given location functions, compute which faces satisfy the condition.
+
+        Parameters
+        ----------
+        location_fns : list[callable]
+            Location function: inputs a point, returns True if on the boundary.
+            If it takes 2 args, second is the node/face index.
+
+        Returns
+        -------
+        boundary_inds_list : list[JaxArray]
+            Shape (num_selected_faces, 2).
+            [k][i, 0] = global cell index of the ith selected face.
+            [k][i, 1] = local face index of the ith selected face.
+        """
+        cell_points = np.take(self.points, self.cells, axis=0)  # (num_cells, num_nodes, dim)
+        cell_face_points = np.take(cell_points, self.face_inds, axis=1)  # (num_cells, num_faces, num_face_vertices, dim)
+        cell_face_inds = np.take(self.cells, self.face_inds, axis=1)  # (num_cells, num_faces, num_face_vertices)
+        boundary_inds_list = []
+        if location_fns is not None:
+            for i in range(len(location_fns)):
+                num_args = location_fns[i].__code__.co_argcount
+                if num_args == 1:
+                    location_fn = lambda point, ind: location_fns[i](point)
+                elif num_args == 2:
+                    location_fn = location_fns[i]
+                else:
+                    raise ValueError(f"Wrong number of arguments for location_fn: must be 1 or 2, get {num_args}")
+
+                vmap_location_fn = jax.vmap(location_fn)
+
+                def on_boundary(cell_points, cell_inds):
+                    boundary_flag = vmap_location_fn(cell_points, cell_inds)
+                    return np.all(boundary_flag)
+
+                vvmap_on_boundary = jax.vmap(jax.vmap(on_boundary))
+                boundary_flags = vvmap_on_boundary(cell_face_points, cell_face_inds)
+                boundary_inds = np.argwhere(boundary_flags)  # (num_selected_faces, 2)
+                boundary_inds_list.append(boundary_inds)
+        return boundary_inds_list
+    
+    def convert_from_dof_to_quad(self, sol):
+        """Obtain quad values from nodal solution.
+
+        Parameters
+        ----------
+        sol : JaxArray
+            Shape is (num_total_nodes, vec).
+
+        Returns
+        -------
+        u : JaxArray
+            Shape is (num_cells, num_quads, vec).
+        """
+        # (num_total_nodes, vec) -> (num_cells, num_nodes, vec)
+        cells_sol = sol[self.cells]
+        # (num_cells, 1, num_nodes, vec) * (1, num_quads, num_nodes, 1) -> (num_cells, num_quads, num_nodes, vec) -> (num_cells, num_quads, vec)
+        u = np.sum(cells_sol[:, None, :, :] * self.shape_vals[None, :, :, None], axis=2)
+        return u
+    
+    def convert_from_dof_to_face_quad(self, sol, boundary_inds):
+        """Obtain surface solution from nodal solution.
+
+        Parameters
+        ----------
+        sol : JaxArray
+            Shape is (num_total_nodes, vec).
+        boundary_inds : NumpyArray
+            Shape is (num_selected_faces, 2).
+
+        Returns
+        -------
+        u : JaxArray
+            Shape is (num_selected_faces, num_face_quads, vec).
+        """
+        cells_old_sol = sol[self.cells]  # (num_cells, num_nodes, vec)
+        selected_cell_sols = cells_old_sol[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, vec)
+        selected_face_shape_vals = self.face_shape_vals[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes)
+        u = np.sum(selected_cell_sols[:, None, :, :] * selected_face_shape_vals[:, :, :, None], axis=2)
+        return u
+    
+    def sol_to_grad(self, sol):
+        """Obtain solution gradient from nodal solution.
+
+        Parameters
+        ----------
+        sol : JaxArray
+            Shape is (num_total_nodes, vec).
+
+        Returns
+        -------
+        u_grads : JaxArray
+            Shape is (num_cells, num_quads, vec, dim).
+        """
+        # (num_cells, 1, num_nodes, vec, 1) * (num_cells, num_quads, num_nodes, 1, dim) -> (num_cells, num_quads, num_nodes, vec, dim)
+        u_grads = np.take(sol, self.cells, axis=0)[:, None, :, :, None] * self.shape_grads[:, :, :, None, :]
+        u_grads = np.sum(u_grads, axis=2)  # (num_cells, num_quads, vec, dim)
+        return u_grads

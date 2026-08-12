@@ -1,0 +1,24 @@
+# Core
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.6
+pyyaml>=6.0
+
+# Differentiable solver stack (JAX-based)
+jax>=0.4.0
+jaxlib>=0.4.0
+equinox>=0.1.0
+lineax>=0.1.0
+
+# FEAX backend (optional; direct/krylov JAX FEM linear solvers)
+feax>=0.2.0
+
+# Optimizers (loaded lazily — only needed for the optimizer you use)
+optax>=0.1.7
+cma>=3.2.0
+pymoo>=0.6.0
+optuna>=3.2.0
+scikit-optimize>=0.9.0
+
+# Testing
+pytest>=7.0

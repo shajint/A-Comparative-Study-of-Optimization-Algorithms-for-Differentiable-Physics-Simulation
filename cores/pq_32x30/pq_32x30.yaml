@@ -1,0 +1,36 @@
+# Core spec for the PQ32/30 core - the YAML file IS the spec.
+# Loaded directly by optimizers.objective.load_core_spec (no loader layer).
+# Full datasheet reference: pq_32x30.pdf (same folder).
+name: pq_32x30
+
+params:
+  center_post_diameter: 0.01345   # m
+  leg_inner_diameter: 0.03035     # m
+  leg_height: 0.034               # m
+  window_height: 0.0213           # m
+  coil_clearance: 0.0005          # m
+  mur: 1680                       # N87 relative permeability
+  A_e: 1.54e-4                    # m2 effective cross-section
+  l_e: 6.78e-2                    # m effective magnetic path
+  sigma_l_over_A: 441             # 1/m
+  AL: 4800                        # nH/N^2 ungapped (N87)
+  material: N87
+
+bounds:
+  - [0.010, 0.018]
+  - [0.022, 0.040]
+  - [0.020, 0.045]
+  - [0.012, 0.032]
+  - [0.0001, 0.003]
+  - [0.00005, 0.005]
+
+param_names:
+  - center_post_diameter
+  - leg_inner_diameter
+  - leg_height
+  - window_height
+  - coil_clearance
+  - gap_size
+
+target_L: 2.6e-7                  # H
+mesh_size: 0.001                  # m
