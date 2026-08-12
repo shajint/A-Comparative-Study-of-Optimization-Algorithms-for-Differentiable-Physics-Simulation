@@ -1,13 +1,15 @@
 # A Comparative Study of Optimization Algorithms for Differentiable Physics Simulation
 
 A fully differentiable, JAX-based finite-element (FEM) framework for the inverse
-design of magnetic components, used to systematically benchmark gradient-based,
-evolutionary, and surrogate-based optimization algorithms on a common solver.
+design of magnetic components, used to systematically benchmark **gradient-based
+and gradient-free** optimization algorithms — including evolutionary and
+surrogate-based methods — on a common solver.
 
 Built with JAX / Equinox / Lineax, the framework propagates exact gradients
 through the entire magnetostatics solve — geometry construction, sparse matrix
-assembly, and the linear solve — enabling gradient-based design optimization of
-PQ-core transformers without any discretization of the physics by hand.
+assembly, and the linear solve — enabling physics-based AI optimization
+(gradient-based design optimization) of PQ-core transformers without any
+discretization of the physics by hand.
 
 ## Highlights
 
@@ -16,10 +18,12 @@ PQ-core transformers without any discretization of the physics by hand.
 - **Pluggable linear-solver backends** — `scipy.sparse` spsolve, Lineax (CG/BiCGSTAB/LU),
   and FEAX (direct/krylov) — interchangeable on a fixed mesh with agreement to
   ~1e-11 nH, enabling fair backend-vs-backend timing studies.
-- **Five optimizer families** under one uniform contract (`run_<name>(core_spec)`
-  -> result dict): L-BFGS-B, Adam and its family (AdamW, AdaBelief, AMSGrad,
-  RAdam, NAdam, Yogi, Lion, Fromage, ...), CMA-ES, NSGA-III, and Bayesian
-  optimization (Optuna/Scikit-Optimize).
+- **Five optimizer families under two paradigms** — a uniform contract
+  (`run_<name>(core_spec)` -> result dict) that directly compares
+  **gradient-based optimizers** (L-BFGS-B; Adam and its family — AdamW,
+  AdaBelief, AMSGrad, RAdam, NAdam, Yogi, Lion, Fromage, ...) against
+  **gradient-free optimizers** (CMA-ES, NSGA-III, and Bayesian optimization via
+  Optuna/Scikit-Optimize).
 - **Multi-objective objective** — inductance targeting with optional volume
   regularization and core-vs-air energy reporting.
 - **Reproducible comparison protocol** — every optimized design is re-solved at a
@@ -105,8 +109,11 @@ pytest -m slow             # long-running physics/verification tests
 
 ## Methodology
 
-All optimizers optimize the same differentiable objective on the same core at a
-fixed budget (measured in FEM solve-equivalents). L-BFGS-B runs on a coarse
+All optimizers — gradient-based (L-BFGS-B, Adam family) and gradient-free
+(CMA-ES, NSGA-III, Bayesian) — optimize the same differentiable objective on the
+same core at a fixed budget (measured in FEM solve-equivalents), giving a
+controlled comparison of the two paradigms for physics-based AI optimization.
+L-BFGS-B runs on a coarse
 sweep mesh to avoid a large one-time XLA compile; every optimized design is
 then re-solved at the production mesh (1 mm) so the reported `L@1mm` comparison
 is unbiased across optimizers. The linear-solver backends are validated to agree
